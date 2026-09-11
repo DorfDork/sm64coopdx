@@ -1,0 +1,1718 @@
+diff --git a/src/rt64lib/contrib/nv_helpers_dx12/BottomLevelASGenerator.cpp b/src/rt64lib/contrib/nv_helpers_dx12/BottomLevelASGenerator.cpp
+index 7e7d379..a0f6b94 100644
+--- a/src/rt64lib/contrib/nv_helpers_dx12/BottomLevelASGenerator.cpp
++++ b/src/rt64lib/contrib/nv_helpers_dx12/BottomLevelASGenerator.cpp
+@@ -243,5 +243,12 @@ void BottomLevelASGenerator::Generate(
+   
+   // Build the AS
+   commandList->BuildRaytracingAccelerationStructure(&buildDesc, 0, nullptr);
++
++  // Top-level AS already waits on its result. Bottom-level builds did not, so
++  // AMD can refit the TLAS / DispatchRays against a BLAS that is still writing.
++  D3D12_RESOURCE_BARRIER uavBarrier = {};
++  uavBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
++  uavBarrier.UAV.pResource = resultBuffer;
++  commandList->ResourceBarrier(1, &uavBarrier);
+ }
+ } // namespace nv_helpers_dx12
+diff --git a/src/rt64lib/contrib/nv_helpers_dx12/RaytracingPipelineGenerator.cpp b/src/rt64lib/contrib/nv_helpers_dx12/RaytracingPipelineGenerator.cpp
+index 560142d..377fbe0 100644
+--- a/src/rt64lib/contrib/nv_helpers_dx12/RaytracingPipelineGenerator.cpp
++++ b/src/rt64lib/contrib/nv_helpers_dx12/RaytracingPipelineGenerator.cpp
+@@ -42,8 +42,27 @@ compiling in debug mode.
+ #include "RaytracingPipelineGenerator.h"
+ 
+ #include "dxcapi.h"
+-#include <unordered_set>
++#include <cstdio>
+ #include <stdexcept>
++#include <unordered_map>
++#include <unordered_set>
++#include <windows.h>
++
++// Isolated from C++ unwind so MSVC can use SEH around the driver call.
++// AMD's DXIL compiler (amdxc64.dll) has historically crashed here on some drivers.
++static HRESULT CreateStateObjectSEH(ID3D12Device8 *device, const D3D12_STATE_OBJECT_DESC *desc, ID3D12StateObject **outObject) {
++  if (outObject == nullptr) {
++    return E_POINTER;
++  }
++
++  *outObject = nullptr;
++  __try {
++    return device->CreateStateObject(desc, IID_PPV_ARGS(outObject));
++  }
++  __except (EXCEPTION_EXECUTE_HANDLER) {
++    return HRESULT_FROM_WIN32(GetExceptionCode());
++  }
++}
+ 
+ namespace nv_helpers_dx12
+ {
+@@ -54,9 +73,16 @@ namespace nv_helpers_dx12
+ RayTracingPipelineGenerator::RayTracingPipelineGenerator(ID3D12Device8* device)
+     : m_device(device)
+ {
+-  // The pipeline creation requires having at least one empty global and local root signatures, so
+-  // we systematically create both, as this does not incur any overhead
+-  CreateDummyRootSignatures();
++}
++
++void RayTracingPipelineGenerator::SetGlobalRootSignature(ID3D12RootSignature* rootSignature)
++{
++  m_dummyGlobalRootSignature = rootSignature;
++}
++
++ID3D12RootSignature* RayTracingPipelineGenerator::GetGlobalRootSignature() const
++{
++  return m_dummyGlobalRootSignature;
+ }
+ 
+ //--------------------------------------------------------------------------------------------------
+@@ -137,25 +163,123 @@ void RayTracingPipelineGenerator::SetMaxRecursionDepth(UINT maxDepth)
+ // Compiles the raytracing state object
+ ID3D12StateObject* RayTracingPipelineGenerator::Generate()
+ {
+-  // The pipeline is made of a set of sub-objects, representing the DXIL libraries, hit group
+-  // declarations, root signature associations, plus some configuration objects
++  CreateDummyRootSignatures();
++
++  // AMD's DXIL compiler (amdxc64) crashes in CreateStateObject when two exports from the
++  // same DXIL library get different local root signatures. The NVIDIA helper left miss
++  // shaders on an empty dummy RS while PrimaryRayGen kept the full raygen RS, both living
++  // in PrimaryRayGen.hlsl. Inherit the library's existing local RS instead.
++  {
++    std::unordered_map<std::wstring, ID3D12RootSignature *> symbolToRS;
++    for (const RootSignatureAssociation &assoc : m_rootSignatureAssociations) {
++      for (const std::wstring &sym : assoc.m_symbols) {
++        symbolToRS[sym] = assoc.m_rootSignature;
++      }
++    }
++
++    for (const Library &lib : m_libraries) {
++      ID3D12RootSignature *libraryRS = nullptr;
++      for (const std::wstring &name : lib.m_exportedSymbols) {
++        auto it = symbolToRS.find(name);
++        if (it != symbolToRS.end()) {
++          libraryRS = it->second;
++          break;
++        }
++      }
++      if (libraryRS == nullptr) {
++        continue;
++      }
++
++      std::vector<std::wstring> extra;
++      for (const std::wstring &name : lib.m_exportedSymbols) {
++        if (symbolToRS.find(name) == symbolToRS.end()) {
++          extra.push_back(name);
++          symbolToRS[name] = libraryRS;
++        }
++      }
++      if (!extra.empty()) {
++        AddRootSignatureAssociation(libraryRS, extra);
++      }
++    }
++
++    // Hit-group associations do not automatically apply to closest-hit/any-hit on AMD.
++    // Bind those member shaders to the same local RS as their hit group.
++    for (const HitGroup &group : m_hitGroups) {
++      auto it = symbolToRS.find(group.m_hitGroupName);
++      if (it == symbolToRS.end()) {
++        continue;
++      }
++
++      ID3D12RootSignature *hitGroupRS = it->second;
++      std::vector<std::wstring> extra;
++      const std::wstring *members[] = {
++          &group.m_closestHitSymbol, &group.m_anyHitSymbol, &group.m_intersectionSymbol};
++      for (const std::wstring *name : members) {
++        if (!name->empty() && symbolToRS.find(*name) == symbolToRS.end()) {
++          extra.push_back(*name);
++          symbolToRS[*name] = hitGroupRS;
++        }
++      }
++      if (!extra.empty()) {
++        AddRootSignatureAssociation(hitGroupRS, extra);
++      }
++    }
++  }
++
++  // One LOCAL_ROOT_SIGNATURE subobject per unique RS. Declaring the same object twice
++  // (custom hit groups reuse one signature) crashes AMD.
++  struct MergedLocalRS {
++    ID3D12RootSignature *m_rootSignature = nullptr;
++    ID3D12RootSignature *m_rootSignaturePointer = nullptr;
++    std::vector<std::wstring> m_symbols;
++    std::vector<LPCWSTR> m_symbolPointers;
++    D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION m_association = {};
++  };
++
++  std::vector<MergedLocalRS> merged;
++  merged.reserve(m_rootSignatureAssociations.size());
++  for (const RootSignatureAssociation &assoc : m_rootSignatureAssociations) {
++    MergedLocalRS *slot = nullptr;
++    for (MergedLocalRS &existing : merged) {
++      if (existing.m_rootSignature == assoc.m_rootSignature) {
++        slot = &existing;
++        break;
++      }
++    }
++    if (slot == nullptr) {
++      merged.emplace_back();
++      slot = &merged.back();
++      slot->m_rootSignature = assoc.m_rootSignature;
++      slot->m_rootSignaturePointer = assoc.m_rootSignature;
++    }
++    slot->m_symbols.insert(slot->m_symbols.end(), assoc.m_symbols.begin(), assoc.m_symbols.end());
++  }
++
++  for (MergedLocalRS &entry : merged) {
++    entry.m_symbolPointers.clear();
++    entry.m_symbolPointers.reserve(entry.m_symbols.size());
++    for (const std::wstring &name : entry.m_symbols) {
++      entry.m_symbolPointers.push_back(name.c_str());
++    }
++  }
++
++  // Leave the shader config unassociated so it is the default for every export.
++  // Associating it only with hit-group names leaves closest-hit/any-hit without a
++  // config on AMD. Do not emit an empty dummy local RS; unused exports get an
++  // implicit empty local RS from the runtime.
+   UINT64 subobjectCount =
+-      m_libraries.size() +                     // DXIL libraries
+-      m_hitGroups.size() +                     // Hit group declarations
+-      1 +                                      // Shader configuration
+-      1 +                                      // Shader payload
+-      2 * m_rootSignatureAssociations.size() + // Root signature declaration + association
+-      2 +                                      // Empty global and local root signatures
+-      1;                                       // Final pipeline subobject
+-
+-  // Initialize a vector with the target object count. It is necessary to make the allocation before
+-  // adding subobjects as some subobjects reference other subobjects by pointer. Using push_back may
+-  // reallocate the array and invalidate those pointers.
++      m_libraries.size() +
++      m_hitGroups.size() +
++      1 +                 // shader config (default)
++      2 * merged.size() + // local RS declaration + association
++      1 +                 // global RS
++      1;                  // pipeline config
++
++  // Allocate before adding subobjects; later entries point at earlier ones.
+   std::vector<D3D12_STATE_SUBOBJECT> subobjects(subobjectCount);
+ 
+   UINT currentIndex = 0;
+ 
+-  // Add all the DXIL libraries
+   for (const Library& lib : m_libraries)
+   {
+     D3D12_STATE_SUBOBJECT libSubobject = {};
+@@ -165,7 +289,6 @@ ID3D12StateObject* RayTracingPipelineGenerator::Generate()
+     subobjects[currentIndex++] = libSubobject;
+   }
+ 
+-  // Add all the hit group declarations
+   for (const HitGroup& group : m_hitGroups)
+   {
+     D3D12_STATE_SUBOBJECT hitGroup = {};
+@@ -175,7 +298,6 @@ ID3D12StateObject* RayTracingPipelineGenerator::Generate()
+     subobjects[currentIndex++] = hitGroup;
+   }
+ 
+-  // Add a subobject for the shader payload configuration
+   D3D12_RAYTRACING_SHADER_CONFIG shaderDesc = {};
+   shaderDesc.MaxPayloadSizeInBytes = m_maxPayLoadSizeInBytes;
+   shaderDesc.MaxAttributeSizeInBytes = m_maxAttributeSizeInBytes;
+@@ -186,48 +308,14 @@ ID3D12StateObject* RayTracingPipelineGenerator::Generate()
+ 
+   subobjects[currentIndex++] = shaderConfigObject;
+ 
+-  // Build a list of all the symbols for ray generation, miss and hit groups
+-  // Those shaders have to be associated with the payload definition
+-  std::vector<std::wstring> exportedSymbols = {};
+-  std::vector<LPCWSTR> exportedSymbolPointers = {};
+-  BuildShaderExportList(exportedSymbols);
+-
+-  // Build an array of the string pointers
+-  exportedSymbolPointers.reserve(exportedSymbols.size());
+-  for (const auto& name : exportedSymbols)
++  for (MergedLocalRS& assoc : merged)
+   {
+-    exportedSymbolPointers.push_back(name.c_str());
+-  }
+-  const WCHAR** shaderExports = exportedSymbolPointers.data();
+-
+-  // Add a subobject for the association between shaders and the payload
+-  D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION shaderPayloadAssociation = {};
+-  shaderPayloadAssociation.NumExports = static_cast<UINT>(exportedSymbols.size());
+-  shaderPayloadAssociation.pExports = shaderExports;
+-
+-  // Associate the set of shaders with the payload defined in the previous subobject
+-  shaderPayloadAssociation.pSubobjectToAssociate = &subobjects[(currentIndex - 1)];
+-
+-  // Create and store the payload association object
+-  D3D12_STATE_SUBOBJECT shaderPayloadAssociationObject = {};
+-  shaderPayloadAssociationObject.Type = D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION;
+-  shaderPayloadAssociationObject.pDesc = &shaderPayloadAssociation;
+-  subobjects[currentIndex++] = shaderPayloadAssociationObject;
+-
+-  // The root signature association requires two objects for each: one to declare the root
+-  // signature, and another to associate that root signature to a set of symbols
+-  for (RootSignatureAssociation& assoc : m_rootSignatureAssociations)
+-  {
+-
+-    // Add a subobject to declare the root signature
+     D3D12_STATE_SUBOBJECT rootSigObject = {};
+     rootSigObject.Type = D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE;
+-    rootSigObject.pDesc = &assoc.m_rootSignature;
++    rootSigObject.pDesc = &assoc.m_rootSignaturePointer;
+ 
+     subobjects[currentIndex++] = rootSigObject;
+ 
+-    // Add a subobject for the association between the exported shader symbols and the root
+-    // signature
+     assoc.m_association.NumExports = static_cast<UINT>(assoc.m_symbolPointers.size());
+     assoc.m_association.pExports = assoc.m_symbolPointers.data();
+     assoc.m_association.pSubobjectToAssociate = &subobjects[(currentIndex - 1)];
+@@ -239,44 +327,33 @@ ID3D12StateObject* RayTracingPipelineGenerator::Generate()
+     subobjects[currentIndex++] = rootSigAssociationObject;
+   }
+ 
+-  // The pipeline construction always requires an empty global root signature
+-  D3D12_STATE_SUBOBJECT globalRootSig;
++  D3D12_STATE_SUBOBJECT globalRootSig = {};
+   globalRootSig.Type = D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE;
+-  ID3D12RootSignature* dgSig = m_dummyGlobalRootSignature;
+-  globalRootSig.pDesc = &dgSig;
++  globalRootSig.pDesc = &m_dummyGlobalRootSignature;
+ 
+   subobjects[currentIndex++] = globalRootSig;
+ 
+-  // The pipeline construction always requires an empty local root signature
+-  D3D12_STATE_SUBOBJECT dummyLocalRootSig;
+-  dummyLocalRootSig.Type = D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE;
+-  ID3D12RootSignature* dlSig = m_dummyLocalRootSignature;
+-  dummyLocalRootSig.pDesc = &dlSig;
+-  subobjects[currentIndex++] = dummyLocalRootSig;
+-
+-  // Add a subobject for the ray tracing pipeline configuration
+   D3D12_RAYTRACING_PIPELINE_CONFIG pipelineConfig = {};
+   pipelineConfig.MaxTraceRecursionDepth = m_maxRecursionDepth;
+ 
+   D3D12_STATE_SUBOBJECT pipelineConfigObject = {};
+   pipelineConfigObject.Type = D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG;
+   pipelineConfigObject.pDesc = &pipelineConfig;
+-  
++
+   subobjects[currentIndex++] = pipelineConfigObject;
+ 
+-  // Describe the ray tracing pipeline state object
+   D3D12_STATE_OBJECT_DESC pipelineDesc = {};
+   pipelineDesc.Type = D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE;
+-  pipelineDesc.NumSubobjects = currentIndex; // static_cast<UINT>(subobjects.size());
++  pipelineDesc.NumSubobjects = currentIndex;
+   pipelineDesc.pSubobjects = subobjects.data();
+ 
+   ID3D12StateObject* rtStateObject = nullptr;
+ 
+-  // Create the state object
+-  HRESULT hr = m_device->CreateStateObject(&pipelineDesc, IID_PPV_ARGS(&rtStateObject));
++  HRESULT hr = CreateStateObjectSEH(m_device, &pipelineDesc, &rtStateObject);
+   if (FAILED(hr))
+   {
+-    throw std::logic_error("Could not create the raytracing state object");
++    fprintf(stderr, "RT64: CreateStateObject failed, hr=0x%08lX\n", static_cast<unsigned long>(hr));
++    throw std::runtime_error("Could not create the raytracing state object");
+   }
+ 
+   return rtStateObject;
+@@ -284,27 +361,29 @@ ID3D12StateObject* RayTracingPipelineGenerator::Generate()
+ 
+ //--------------------------------------------------------------------------------------------------
+ //
+-// The pipeline creation requires having at least one empty global and local root signatures, so
+-// we systematically create both
++// The pipeline needs a global root signature. An empty one is created only when the caller
++// did not share one. A dummy local RS is not required: shaders without an association use an
++// implicit empty local RS, and emitting an extra unassociated local RS crashes AMD.
+ void RayTracingPipelineGenerator::CreateDummyRootSignatures()
+ {
+-  // Creation of the global root signature
++  if (m_dummyGlobalRootSignature != nullptr) {
++    return;
++  }
++
+   D3D12_ROOT_SIGNATURE_DESC rootDesc = {};
+   rootDesc.NumParameters = 0;
+   rootDesc.pParameters = nullptr;
+-  // A global root signature is the default, hence this flag
+   rootDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+ 
+-  HRESULT hr = 0;
+-
+-  ID3DBlob* serializedRootSignature;
+-  ID3DBlob* error;
+-
+-  // Create the empty global root signature
+-  hr = D3D12SerializeRootSignature(&rootDesc, D3D_ROOT_SIGNATURE_VERSION_1,
+-                                   &serializedRootSignature, &error);
++  ID3DBlob* serializedRootSignature = nullptr;
++  ID3DBlob* error = nullptr;
++  HRESULT hr = D3D12SerializeRootSignature(&rootDesc, D3D_ROOT_SIGNATURE_VERSION_1,
++                                           &serializedRootSignature, &error);
+   if (FAILED(hr))
+   {
++    if (error != nullptr) {
++      error->Release();
++    }
+     throw std::logic_error("Could not serialize the global root signature");
+   }
+   hr = m_device->CreateRootSignature(0, serializedRootSignature->GetBufferPointer(),
+@@ -312,27 +391,12 @@ void RayTracingPipelineGenerator::CreateDummyRootSignatures()
+                                      IID_PPV_ARGS(&m_dummyGlobalRootSignature));
+ 
+   serializedRootSignature->Release();
+-  if (FAILED(hr))
+-  {
+-    throw std::logic_error("Could not create the global root signature");
++  if (error != nullptr) {
++    error->Release();
+   }
+-
+-  // Create the local root signature, reusing the same descriptor but altering the creation flag
+-  rootDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE;
+-  hr = D3D12SerializeRootSignature(&rootDesc, D3D_ROOT_SIGNATURE_VERSION_1,
+-                                   &serializedRootSignature, &error);
+   if (FAILED(hr))
+   {
+-    throw std::logic_error("Could not serialize the local root signature");
+-  }
+-  hr = m_device->CreateRootSignature(0, serializedRootSignature->GetBufferPointer(),
+-                                     serializedRootSignature->GetBufferSize(),
+-                                     IID_PPV_ARGS(&m_dummyLocalRootSignature));
+-
+-  serializedRootSignature->Release();
+-  if (FAILED(hr))
+-  {
+-    throw std::logic_error("Could not create the local root signature");
++    throw std::logic_error("Could not create the global root signature");
+   }
+ }
+ 
+@@ -477,6 +541,7 @@ RayTracingPipelineGenerator::HitGroup::HitGroup(std::wstring hitGroupName,
+ {
+   // Indicate which shader program is used for closest hit, leave the other
+   // ones undefined (default behavior), export the name of the group
++  m_desc.Type = D3D12_HIT_GROUP_TYPE_TRIANGLES;
+   m_desc.HitGroupExport = m_hitGroupName.c_str();
+   m_desc.ClosestHitShaderImport = m_closestHitSymbol.empty() ? nullptr : m_closestHitSymbol.c_str();
+   m_desc.AnyHitShaderImport = m_anyHitSymbol.empty() ? nullptr : m_anyHitSymbol.c_str();
+diff --git a/src/rt64lib/contrib/nv_helpers_dx12/RaytracingPipelineGenerator.h b/src/rt64lib/contrib/nv_helpers_dx12/RaytracingPipelineGenerator.h
+index b16125a..dc6afca 100644
+--- a/src/rt64lib/contrib/nv_helpers_dx12/RaytracingPipelineGenerator.h
++++ b/src/rt64lib/contrib/nv_helpers_dx12/RaytracingPipelineGenerator.h
+@@ -122,6 +122,12 @@ public:
+   /// Compiles the raytracing state object
+   ID3D12StateObject* Generate();
+ 
++  /// Optional: bind the same empty global root signature that DispatchRays will use.
++  /// AMD and vkd3d-proton require SetComputeRootSignature with a signature compatible
++  /// with the RTPSO global root signature. Using one shared object avoids driver mismatches.
++  void SetGlobalRootSignature(ID3D12RootSignature* rootSignature);
++  ID3D12RootSignature* GetGlobalRootSignature() const;
++
+ private:
+   /// Storage for DXIL libraries and their exported symbols
+   struct Library
+@@ -168,8 +174,9 @@ private:
+     D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION m_association = {};
+   };
+ 
+-  /// The pipeline creation requires having at least one empty global and local root signatures, so
+-  /// we systematically create both
++  /// The pipeline needs a global root signature. An empty one is created only when the caller
++  /// did not share one. A dummy local RS is not emitted; shaders without an association use an
++  /// implicit empty local RS.
+   void CreateDummyRootSignatures();
+ 
+   /// Build a list containing the export symbols for the ray generation shaders, miss shaders, and
+@@ -188,8 +195,8 @@ private:
+   UINT m_maxRecursionDepth = 1;
+ 
+   ID3D12Device8* m_device;
+-  ID3D12RootSignature* m_dummyLocalRootSignature;
+-  ID3D12RootSignature* m_dummyGlobalRootSignature;
++  ID3D12RootSignature* m_dummyLocalRootSignature = nullptr;
++  ID3D12RootSignature* m_dummyGlobalRootSignature = nullptr;
+ 
+   
+ };
+diff --git a/src/rt64lib/contrib/nv_helpers_dx12/ShaderBindingTableGenerator.cpp b/src/rt64lib/contrib/nv_helpers_dx12/ShaderBindingTableGenerator.cpp
+index 654d392..4358097 100644
+--- a/src/rt64lib/contrib/nv_helpers_dx12/ShaderBindingTableGenerator.cpp
++++ b/src/rt64lib/contrib/nv_helpers_dx12/ShaderBindingTableGenerator.cpp
+@@ -36,6 +36,7 @@ dispatch rays description.
+ 
+ #include "ShaderBindingTableGenerator.h"
+ 
++#include <cstring>
+ #include <stdexcept>
+ 
+ // Helper to compute aligned buffer sizes
+@@ -110,6 +111,11 @@ void ShaderBindingTableGenerator::Generate(ID3D12Resource* sbtBuffer,
+   {
+     throw std::logic_error("Could not map the shader binding table");
+   }
++
++  // Padding between the shader identifier and the next record is otherwise leftover
++  // upload-heap garbage. AMD is less forgiving of that than NVIDIA.
++  const D3D12_RESOURCE_DESC sbtDesc = sbtBuffer->GetDesc();
++  memset(pData, 0, static_cast<size_t>(sbtDesc.Width));
+   // Copy the shader identifiers followed by their resource pointers or root constants: first the
+   // ray generation, then the miss shaders, and finally the set of hit groups
+   uint32_t offset = 0;
+diff --git a/src/rt64lib/private/rt64_common.h b/src/rt64lib/private/rt64_common.h
+index ccb0b51..93774f0 100644
+--- a/src/rt64lib/private/rt64_common.h
++++ b/src/rt64lib/private/rt64_common.h
+@@ -16,6 +16,7 @@
+ 
+ #include <dxgi1_4.h>
+ #include <dxgi1_5.h>
++#include <dxgi1_6.h>
+ #include <d3d12.h>
+ 
+ #include "D3D12MemoryAllocator/D3D12MemAlloc.h"
+@@ -370,19 +371,29 @@ namespace RT64 {
+ #define D3D12_CHECK( call )                                                         \
+     do                                                                              \
+     {                                                                               \
+-        HRESULT hr = call;                                                          \
+-        if (FAILED(hr))														        \
++        HRESULT d3d12CallResult = call;                                             \
++        if (FAILED(d3d12CallResult))                                                \
+         {																	        \
+ 			char errorMessage[512];													\
+-			snprintf(errorMessage, sizeof(errorMessage), "D3D12 call " #call " "	\
+-				"failed with error code %X.", hr);									\
+-																					\
++			if ((d3d12CallResult == DXGI_ERROR_DEVICE_REMOVED) ||                   \
++				(d3d12CallResult == DXGI_ERROR_DEVICE_RESET) ||                     \
++				(d3d12CallResult == DXGI_ERROR_DEVICE_HUNG)) {                      \
++				snprintf(errorMessage, sizeof(errorMessage),                        \
++					"D3D12 call " #call " failed with error code %X. "              \
++					"The GPU already hung (same as Present deviceRemovedReason "    \
++					"0x887A0006); this is not an allocator/out-of-memory failure.", \
++					d3d12CallResult);                                               \
++			}                                                                       \
++			else {                                                                  \
++				snprintf(errorMessage, sizeof(errorMessage), "D3D12 call " #call " "	\
++					"failed with error code %X.", d3d12CallResult);					\
++			}                                                                       \
+             throw std::runtime_error(errorMessage);                                 \
+         }                                                                           \
+     } while( 0 )
+ 
+ #define RT64_CATCH_EXCEPTION()							\
+-	catch (const std::runtime_error &e) {				\
++	catch (const std::exception &e) {				\
+ 		RT64::GlobalLastError = std::string(e.what());	\
+ 		fprintf(stderr, "%s\n", e.what());				\
+ 	}
+diff --git a/src/rt64lib/private/rt64_device.cpp b/src/rt64lib/private/rt64_device.cpp
+index 2173804..48b29e8 100644
+--- a/src/rt64lib/private/rt64_device.cpp
++++ b/src/rt64lib/private/rt64_device.cpp
+@@ -4,6 +4,9 @@
+ 
+ #include <algorithm>
+ #include <cassert>
++#include <cstring>
++#include <cstdlib>
++#include <stdexcept>
+ 
+ #include <dwmapi.h>
+ 
+@@ -62,6 +65,7 @@
+ 
+ RT64::Device::Device(HWND hwnd) {
+ 	RT64_LOG_OPEN("rt64.log");
++	amdGpu = false;
+ 
+ 	createDXGIFactory();
+ 	createRaytracingDevice();
+@@ -71,6 +75,7 @@ RT64::Device::Device(HWND hwnd) {
+ 	this->hwnd = hwnd;
+ 	d3dAllocator = nullptr;
+ 	d3dRtStateObject = nullptr;
++	d3dRtGlobalRootSignature = nullptr;
+ 	lastCommandQueueBarrierActive = false;
+ 	lastCopyQueueBarrierActive = false;
+ 	meshBatchActive = false;
+@@ -108,12 +113,12 @@ RT64::Device::Device(HWND hwnd) {
+ 	surfaceMissID = nullptr;
+ 	shadowMissID = nullptr;
+ 	blueNoise = nullptr;
++	dummyBlack = nullptr;
+ 	width = 0;
+ 	height = 0;
+ 	mipmaps = nullptr;
+ 	disableMipmaps = false;
+ 	d3dRtStateObjectProps = nullptr;
+-	d3dRayGenSignature = nullptr;
+ 	d3dDxcCompiler = nullptr;
+ 	d3dDxcLibrary = nullptr;
+ 	d3dComposeRootSignature = nullptr;
+@@ -174,6 +179,10 @@ RT64::Device::~Device() {
+ 	delete blueNoise;
+ 	blueNoise = nullptr;
+ 
++	delete dummyBlack;
++	dummyBlack = nullptr;
++	dummyStructuredBuffer.Release();
++
+ 	for (auto &pipelinePair : d3dCustomRasterPipelines) {
+ 		ReleaseCom(&pipelinePair.second);
+ 	}
+@@ -189,7 +198,7 @@ RT64::Device::~Device() {
+ 
+ 	ReleaseCom(&d3dRtStateObjectProps);
+ 	ReleaseCom(&d3dRtStateObject);
+-	ReleaseCom(&d3dRayGenSignature);
++	ReleaseCom(&d3dRtGlobalRootSignature);
+ 	ReleaseCom(&d3dUberSurfaceHitLibrary);
+ 	ReleaseCom(&d3dUberShadowHitLibrary);
+ 	ReleaseCom(&d3dUberHitSignature);
+@@ -259,13 +268,49 @@ void RT64::Device::createDXGIFactory() {
+ 	UINT dxgiFactoryFlags = 0;
+ 	dxgiFactory = nullptr;
+ 
++	// Probe the high-performance GPU before enabling the D3D12 debug layer.
++	// On AMD, debug-layer startup crashes in amdxc64!GetSettingsBlobsAll
++	// (gdb + page heap on Adrenalin 26.8.1, EmeraldLockdown).
++	bool amdAdapter = false;
++	IDXGIFactory2 *probeFactory = nullptr;
++	if (SUCCEEDED(CreateDXGIFactory2(0, IID_PPV_ARGS(&probeFactory))) && probeFactory != nullptr) {
++		IDXGIFactory6 *factory6 = nullptr;
++		if (SUCCEEDED(probeFactory->QueryInterface(IID_PPV_ARGS(&factory6)))) {
++			IDXGIAdapter1 *adapter = nullptr;
++			if (SUCCEEDED(factory6->EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&adapter)))) {
++				DXGI_ADAPTER_DESC1 desc = {};
++				if (SUCCEEDED(adapter->GetDesc1(&desc))) {
++					amdAdapter = (desc.VendorId == 0x1002);
++				}
++				adapter->Release();
++			}
++			factory6->Release();
++		}
++		probeFactory->Release();
++	}
++
+ #ifndef NDEBUG
+-	ID3D12Debug *debugController;
+-	if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debugController)))) {
+-		debugController->EnableDebugLayer();
++	bool enableDebugLayer = !amdAdapter;
++	const char *forceDebug = getenv("RT64_D3D12_DEBUG");
++	if (forceDebug != nullptr && forceDebug[0] == '1') {
++		enableDebugLayer = true;
++	}
++	else if (forceDebug != nullptr && forceDebug[0] == '0') {
++		enableDebugLayer = false;
++	}
++
++	if (enableDebugLayer) {
++		ID3D12Debug *debugController = nullptr;
++		if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debugController)))) {
++			debugController->EnableDebugLayer();
++			debugController->Release();
+ 
+-		// Enable additional debug layers.
+-		dxgiFactoryFlags |= DXGI_CREATE_FACTORY_DEBUG;
++			// Enable additional debug layers.
++			dxgiFactoryFlags |= DXGI_CREATE_FACTORY_DEBUG;
++		}
++	}
++	else if (amdAdapter) {
++		RT64_LOG_PRINTF("Skipping the D3D12 debug layer on AMD");
+ 	}
+ #endif
+ 
+@@ -275,70 +320,90 @@ void RT64::Device::createDXGIFactory() {
+ void RT64::Device::createRaytracingDevice() {
+ 	d3dAdapter = nullptr;
+ 	d3dDevice = nullptr;
++	amdGpu = false;
++#ifndef RT64_MINIMAL
++	disableMipmaps = false;
++#endif
+ 
+ 	std::stringstream ss;
+-	{
+-		// Attempt to create D3D12 devices and pick the first one that actually supports raytracing.
+-		// This implementation should detect more accurately cases where multiple D3D12 adapters are available
+-		// but they're not raytracing capable, yet there's more devices on the system that fit the criteria.
++	auto tryAdapter = [this, &ss](IDXGIAdapter1 *adapter, UINT adapterIndex) -> bool {
+ 		DXGI_ADAPTER_DESC1 desc;
+-		for (UINT adapterIndex = 0; dxgiFactory->EnumAdapters1(adapterIndex, &d3dAdapter) != DXGI_ERROR_NOT_FOUND; ++adapterIndex) {
+-			d3dAdapter->GetDesc1(&desc);
++		adapter->GetDesc1(&desc);
+ 
+-			// Ignore software adapters.
+-			if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) {
+-				d3dAdapter->Release();
+-				d3dAdapter = nullptr;
+-				continue;
++		if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) {
++			return false;
++		}
++
++		auto handleAdapterError = [this, &ss, &desc, adapterIndex](const std::string &errorSuffix) {
++			ss << "Adapter " << win32::Utf16ToUtf8(desc.Description) << " (#" << adapterIndex << "): " << errorSuffix << std::endl;
++			if (d3dDevice != nullptr) {
++				d3dDevice->Release();
++				d3dDevice = nullptr;
+ 			}
++		};
+ 
+-			auto handleAdapterError = [this, &ss, &desc, &adapterIndex](const std::string &errorSuffix) {
+-				ss << "Adapter " << win32::Utf16ToUtf8(desc.Description) << " (#" << adapterIndex << "): " << errorSuffix << std::endl;
+-				if (d3dDevice != nullptr) {
+-					d3dDevice->Release();
+-					d3dDevice = nullptr;
+-				}
++		HRESULT deviceResult = D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_1, IID_PPV_ARGS(&d3dDevice));
++		if (FAILED(deviceResult)) {
++			handleAdapterError("No D3D12.1 feature level support.");
++			ss << "D3D12CreateDevice error code: " << std::hex << deviceResult << std::endl;
++			return false;
++		}
+ 
+-				if (d3dAdapter != nullptr) {
+-					d3dAdapter->Release();
+-					d3dAdapter = nullptr;
+-				}
+-			};
+-
+-			// Try creating the device for this adapter.
+-			HRESULT deviceResult = D3D12CreateDevice(d3dAdapter, D3D_FEATURE_LEVEL_12_1, IID_PPV_ARGS(&d3dDevice));
+-			if (SUCCEEDED(deviceResult)) {
+-				D3D12_FEATURE_DATA_D3D12_OPTIONS5 options5 = {};
+-				HRESULT checkResult = d3dDevice->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &options5, sizeof(options5));
+-				if (SUCCEEDED(checkResult)) {
+-					if (options5.RaytracingTier < D3D12_RAYTRACING_TIER_1_0) {
+-						handleAdapterError("No raytracing support.");
+-					}
+-					else {
+-						break;
+-					}
+-				}
+-				else {
+-					handleAdapterError("No feature checking at the required level.");
+-					ss << "D3D12Device->CheckFeatureSupport error code: " << std::hex << checkResult << std::endl;
+-				}
+-			}
+-			else {
+-				handleAdapterError("No D3D12.1 feature level support.");
+-				ss << "D3D12CreateDevice error code: " << std::hex << deviceResult << std::endl;
+-			}
++		D3D12_FEATURE_DATA_D3D12_OPTIONS5 options5 = {};
++		HRESULT checkResult = d3dDevice->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &options5, sizeof(options5));
++		if (FAILED(checkResult)) {
++			handleAdapterError("No feature checking at the required level.");
++			ss << "D3D12Device->CheckFeatureSupport error code: " << std::hex << checkResult << std::endl;
++			return false;
++		}
++
++		if (options5.RaytracingTier < D3D12_RAYTRACING_TIER_1_0) {
++			handleAdapterError("No raytracing support.");
++			return false;
++		}
++
++		d3dAdapter = adapter;
++		d3dAdapter->AddRef();
+ 
+-#		ifndef RT64_MINIMAL
+-			// FIXME: Work around AMD's mipmap generation being corrupted until a solution is found.
+-			// Refer to https://github.com/DarioSamo/RT64/issues/54
+-			if (wcsstr(desc.Description, L"AMD") != nullptr) {
+-				disableMipmaps = true;
++		if (desc.VendorId == 0x1002) {
++			amdGpu = true;
++#ifndef RT64_MINIMAL
++			// AMD mipmap generation is corrupted on this backend (https://github.com/DarioSamo/RT64/issues/54).
++			disableMipmaps = true;
++#endif
++			fprintf(stderr, "RT64: AMD GPU detected; FSR frame generation is disabled\n");
++			RT64_LOG_PRINTF("AMD GPU detected; FSR frame generation is disabled");
++		}
++
++		RT64_LOG_PRINTF("Selected adapter: %s", win32::Utf16ToUtf8(desc.Description).c_str());
++		return true;
++	};
++
++	IDXGIFactory6 *factory6 = nullptr;
++	if (SUCCEEDED(dxgiFactory->QueryInterface(IID_PPV_ARGS(&factory6)))) {
++		for (UINT adapterIndex = 0; factory6->EnumAdapterByGpuPreference(adapterIndex, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&d3dAdapter)) != DXGI_ERROR_NOT_FOUND; ++adapterIndex) {
++			IDXGIAdapter1 *candidate = d3dAdapter;
++			d3dAdapter = nullptr;
++			const bool selected = tryAdapter(candidate, adapterIndex);
++			candidate->Release();
++			if (selected) {
++				break;
++			}
++		}
++		factory6->Release();
++	}
++	else {
++		for (UINT adapterIndex = 0; dxgiFactory->EnumAdapters1(adapterIndex, &d3dAdapter) != DXGI_ERROR_NOT_FOUND; ++adapterIndex) {
++			IDXGIAdapter1 *candidate = d3dAdapter;
++			d3dAdapter = nullptr;
++			const bool selected = tryAdapter(candidate, adapterIndex);
++			candidate->Release();
++			if (selected) {
++				break;
+ 			}
+-#		endif
+ 		}
+ 	}
+ 
+-	// Only throw an exception if no device was detected.
+ 	if (d3dDevice == nullptr) {
+ 		throw std::runtime_error("Unable to detect a device capable of raytracing.\n" + ss.str());
+ 	}
+@@ -444,6 +509,10 @@ HWND RT64::Device::getHwnd() const {
+ 	return hwnd;
+ }
+ 
++bool RT64::Device::isAmdGpu() const {
++	return amdGpu;
++}
++
+ ID3D12Device8 *RT64::Device::getD3D12Device() const {
+ 	return d3dDevice;
+ }
+@@ -464,6 +533,10 @@ ID3D12StateObjectProperties *RT64::Device::getD3D12RtStateObjectProperties() con
+ 	return d3dRtStateObjectProps;
+ }
+ 
++ID3D12RootSignature *RT64::Device::getD3D12RtGlobalRootSignature() const {
++	return d3dRtGlobalRootSignature;
++}
++
+ ID3D12Resource *RT64::Device::getD3D12RenderTarget() const {
+ 	return d3dRenderTargets[d3dFrameIndex];
+ }
+@@ -596,6 +669,14 @@ RT64::Texture *RT64::Device::getBlueNoiseTexture() const {
+ 	return blueNoise;
+ }
+ 
++RT64::Texture *RT64::Device::getDummyBlackTexture() const {
++	return dummyBlack;
++}
++
++ID3D12Resource *RT64::Device::getDummyStructuredBuffer() const {
++	return dummyStructuredBuffer.Get();
++}
++
+ CD3DX12_VIEWPORT RT64::Device::getD3D12Viewport() const {
+ 	return d3dViewport;
+ }
+@@ -1114,6 +1195,10 @@ void RT64::Device::loadAssets() {
+ 
+ 	loadBlueNoise();
+ 
++	RT64_LOG_PRINTF("Loading dummy resources");
++
++	loadDummyResources();
++
+ 	RT64_LOG_PRINTF("Waiting for asset load to finish");
+ 
+ 	// Close command list and wait for it to finish.
+@@ -1127,6 +1212,38 @@ void RT64::Device::loadBlueNoise() {
+ 	blueNoise->setRGBA8(LDR_64_64_64_RGB1_BGRA8, sizeof(LDR_64_64_64_RGB1_BGRA8), 512, 512, 512 * 4, false);
+ }
+ 
++void RT64::Device::loadDummyResources() {
++	// AMD samples null SRVs as colorful garbage and can TDR. NVIDIA returns black.
++	static_assert(sizeof(RT64_LIGHT) <= 512, "dummy structured buffer is too small for RT64_LIGHT");
++	static_assert(sizeof(InstanceTransforms) <= 512, "dummy structured buffer is too small for InstanceTransforms");
++	static_assert(sizeof(RT64_MATERIAL) <= 512, "dummy structured buffer is too small for RT64_MATERIAL");
++
++	static const unsigned char dummyBlackPixel[4] = { 0, 0, 0, 0 };
++	dummyBlack = new RT64::Texture(this);
++	dummyBlack->setRGBA8(dummyBlackPixel, sizeof(dummyBlackPixel), 1, 1, 4, false);
++
++	const uint64_t dummySize = 512;
++	AllocatedResource dummyUpload = allocateBuffer(D3D12_HEAP_TYPE_UPLOAD, dummySize, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
++	dummyStructuredBuffer = allocateBuffer(D3D12_HEAP_TYPE_DEFAULT, dummySize, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
++	if (!dummyUpload.IsNull() && !dummyStructuredBuffer.IsNull()) {
++		void *mapped = nullptr;
++		D3D12_CHECK(dummyUpload.Get()->Map(0, nullptr, &mapped));
++		memset(mapped, 0, static_cast<size_t>(dummySize));
++		dummyUpload.Get()->Unmap(0, nullptr);
++
++		d3dCommandList->CopyBufferRegion(dummyStructuredBuffer.Get(), 0, dummyUpload.Get(), 0, dummySize);
++		CD3DX12_RESOURCE_BARRIER toSrv = CD3DX12_RESOURCE_BARRIER::Transition(
++			dummyStructuredBuffer.Get(),
++			D3D12_RESOURCE_STATE_COPY_DEST,
++			D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
++		d3dCommandList->ResourceBarrier(1, &toSrv);
++		submitCommandList();
++		waitForGPU();
++		resetCommandList();
++	}
++	dummyUpload.Release();
++}
++
+ void RT64::Device::createRaytracingPipeline() {
+ 	RT64_LOG_PRINTF("Raytracing pipeline creation started");
+ 
+@@ -1135,6 +1252,11 @@ void RT64::Device::createRaytracingPipeline() {
+ 
+ 	nv_helpers_dx12::RayTracingPipelineGenerator pipeline(d3dDevice);
+ 
++	if (d3dRtGlobalRootSignature == nullptr) {
++		d3dRtGlobalRootSignature = createEmptyGlobalRootSignature();
++	}
++	pipeline.SetGlobalRootSignature(d3dRtGlobalRootSignature);
++
+ 	RT64_LOG_PRINTF("Loading shader libraries");
+ 
+ 	// Shader libraries.
+@@ -1184,9 +1306,7 @@ void RT64::Device::createRaytracingPipeline() {
+ 
+ 	RT64_LOG_PRINTF("Creating root signatures");
+ 
+-	if (d3dRayGenSignature == nullptr) { d3dRayGenSignature = createRayGenSignature(); }
+ 	if (d3dUberHitSignature == nullptr) { d3dUberHitSignature = createUberHitSignature(true); }
+-	if (d3dUberShadowHitSignature == nullptr) { d3dUberShadowHitSignature = createUberHitSignature(false); }
+ 	if (d3dCustomHitSignature == nullptr) { d3dCustomHitSignature = createCustomHitSignature(true); }
+ 	if (d3dCustomShadowHitSignature == nullptr) { d3dCustomShadowHitSignature = createCustomHitSignature(false); }
+ 
+@@ -1215,10 +1335,10 @@ void RT64::Device::createRaytracingPipeline() {
+ 
+ 	RT64_LOG_PRINTF("Adding root signature associations");
+ 
+-	// Associate the root signatures to the hit groups.
+-	pipeline.AddRootSignatureAssociation(d3dRayGenSignature, { L"PrimaryRayGen", L"DirectRayGen", L"IndirectRayGen", L"ReflectionRayGen", L"RefractionRayGen", L"VolumetricRayGen" });
+-	pipeline.AddRootSignatureAssociation(d3dUberHitSignature, { L"UberSurfaceHitGroup" });
+-	pipeline.AddRootSignatureAssociation(d3dUberShadowHitSignature, { L"UberShadowHitGroup" });
++	// Raygen/miss use only the global RS (no local RS). Hit groups keep a tiny local RS
++	// with per-record vertex/index SRVs. Putting the 512-texture heap on a local RS is
++	// what still AVs amdxc64 in CreateStateObject (hr=0xC0000005).
++	pipeline.AddRootSignatureAssociation(d3dUberHitSignature, { L"UberSurfaceHitGroup", L"UberShadowHitGroup" });
+ 
+ 	addedCustomShaders.clear();
+ 	for (Shader *customShader : customShaders) {
+@@ -1237,7 +1357,9 @@ void RT64::Device::createRaytracingPipeline() {
+ 	}
+ 
+ 	// Pipeline configuration. Path tracing only needs one recursion level at most.
+-	pipeline.SetMaxPayloadSize(8 * sizeof(float));
++	// HitInfo is uint + float + two float3s (32 bytes tightly packed). Allow 64 bytes
++	// so HLSL float3 padding cannot undershoot MaxPayloadSizeInBytes on AMD.
++	pipeline.SetMaxPayloadSize(64);
+ 	pipeline.SetMaxAttributeSize(2 * sizeof(float));
+ 	pipeline.SetMaxRecursionDepth(1);
+ 
+@@ -1306,10 +1428,10 @@ void RT64::Device::createDxcCompiler() {
+ 	RT64_LOG_PRINTF("Compiler creation finished");
+ }
+ 
+-ID3D12RootSignature *RT64::Device::createRayGenSignature() {
++ID3D12RootSignature *RT64::Device::createEmptyGlobalRootSignature() {
++	// Shared RT bindings live on the global RS. AMD's DXIL compiler (amdxc64) AVs in
++	// CreateStateObject when this table is a local RS (hr=0xC0000005 on the latest DLL).
+ 	nv_helpers_dx12::RootSignatureGenerator rsc;
+-
+-	// Fill out the heap parameters.
+ 	rsc.AddHeapRangesParameter({
+ 		RT64_UAV_DESCRIPTORS(RT64_UAV_RANGE_ENTRY)
+ 		{ SRV_INDEX(gBackground), 1, 0, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, HEAP_INDEX(gBackground) },
+@@ -1322,8 +1444,11 @@ ID3D12RootSignature *RT64::Device::createRayGenSignature() {
+ 		{ CBV_INDEX(gParams), 1, 0, D3D12_DESCRIPTOR_RANGE_TYPE_CBV, HEAP_INDEX(gParams) }
+ 	});
+ 
+-	// Fill out the samplers.
+-	D3D12_STATIC_SAMPLER_DESC desc;
++	nv_helpers_dx12::RootSignatureGenerator::HeapRanges samplerHeapRange;
++	samplerHeapRange.push_back({ 1, RT64_SAMPLER_HEAP_COUNT, 0, D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 0 });
++	rsc.AddHeapRangesParameter(samplerHeapRange);
++
++	D3D12_STATIC_SAMPLER_DESC desc = {};
+ 	desc.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+ 	desc.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+ 	desc.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+@@ -1338,38 +1463,15 @@ ID3D12RootSignature *RT64::Device::createRayGenSignature() {
+ 	desc.ShaderRegister = 0;
+ 	desc.RegisterSpace = 0;
+ 
+-	return rsc.Generate(d3dDevice, true, false, &desc, 1);
++	return rsc.Generate(d3dDevice, false, false, &desc, 1);
+ }
+ 
+ ID3D12RootSignature *RT64::Device::createCustomHitSignature(bool hitBuffers) {
++	(void)hitBuffers;
+ 	nv_helpers_dx12::RootSignatureGenerator rsc;
+ 	rsc.AddRootParameter(D3D12_ROOT_PARAMETER_TYPE_SRV, SRV_INDEX(vertexBuffer));
+ 	rsc.AddRootParameter(D3D12_ROOT_PARAMETER_TYPE_SRV, SRV_INDEX(indexBuffer));
+ 
+-	{
+-		nv_helpers_dx12::RootSignatureGenerator::HeapRanges heapRanges;
+-
+-		if (hitBuffers) {
+-			heapRanges.push_back({ UAV_INDEX(gHitDistAndFlow), 1, 0, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, HEAP_INDEX(gHitDistAndFlow) });
+-			heapRanges.push_back({ UAV_INDEX(gHitColor), 1, 0, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, HEAP_INDEX(gHitColor) });
+-			heapRanges.push_back({ UAV_INDEX(gHitNormal), 1, 0, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, HEAP_INDEX(gHitNormal) });
+-			heapRanges.push_back({ UAV_INDEX(gHitSpecular), 1, 0, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, HEAP_INDEX(gHitSpecular) });
+-			heapRanges.push_back({ UAV_INDEX(gHitInstanceId), 1, 0, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, HEAP_INDEX(gHitInstanceId) });
+-		}
+-
+-		heapRanges.push_back({ SRV_INDEX(instanceTransforms), 1, 0, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, HEAP_INDEX(instanceTransforms) });
+-		heapRanges.push_back({ SRV_INDEX(instanceMaterials), 1, 0, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, HEAP_INDEX(instanceMaterials) });
+-		heapRanges.push_back({ SRV_INDEX(gTextures), SRV_TEXTURES_MAX, 0, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, HEAP_INDEX(gTextures) });
+-		heapRanges.push_back({ CBV_INDEX(gParams), 1, 0, D3D12_DESCRIPTOR_RANGE_TYPE_CBV, HEAP_INDEX(gParams) });
+-		rsc.AddHeapRangesParameter(heapRanges);
+-	}
+-
+-	{
+-		nv_helpers_dx12::RootSignatureGenerator::HeapRanges samplerHeapRange;
+-		samplerHeapRange.push_back({ 1, RT64_SAMPLER_HEAP_COUNT, 0, D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 0 });
+-		rsc.AddHeapRangesParameter(samplerHeapRange);
+-	}
+-
+ 	for (unsigned int i = 1; i < RT64_MAX_SHADER_UNIFORM_BLOCKS; i++) {
+ 		rsc.AddRootParameter(D3D12_ROOT_PARAMETER_TYPE_CBV, i);
+ 	}
+@@ -1378,34 +1480,10 @@ ID3D12RootSignature *RT64::Device::createCustomHitSignature(bool hitBuffers) {
+ }
+ 
+ ID3D12RootSignature *RT64::Device::createUberHitSignature(bool hitBuffers) {
++	(void)hitBuffers;
+ 	nv_helpers_dx12::RootSignatureGenerator rsc;
+ 	rsc.AddRootParameter(D3D12_ROOT_PARAMETER_TYPE_SRV, SRV_INDEX(vertexBuffer));
+ 	rsc.AddRootParameter(D3D12_ROOT_PARAMETER_TYPE_SRV, SRV_INDEX(indexBuffer));
+-
+-	{
+-		nv_helpers_dx12::RootSignatureGenerator::HeapRanges heapRanges;
+-
+-		if (hitBuffers) {
+-			heapRanges.push_back({ UAV_INDEX(gHitDistAndFlow), 1, 0, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, HEAP_INDEX(gHitDistAndFlow) });
+-			heapRanges.push_back({ UAV_INDEX(gHitColor), 1, 0, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, HEAP_INDEX(gHitColor) });
+-			heapRanges.push_back({ UAV_INDEX(gHitNormal), 1, 0, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, HEAP_INDEX(gHitNormal) });
+-			heapRanges.push_back({ UAV_INDEX(gHitSpecular), 1, 0, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, HEAP_INDEX(gHitSpecular) });
+-			heapRanges.push_back({ UAV_INDEX(gHitInstanceId), 1, 0, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, HEAP_INDEX(gHitInstanceId) });
+-		}
+-
+-		heapRanges.push_back({ SRV_INDEX(instanceTransforms), 1, 0, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, HEAP_INDEX(instanceTransforms) });
+-		heapRanges.push_back({ SRV_INDEX(instanceMaterials), 1, 0, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, HEAP_INDEX(instanceMaterials) });
+-		heapRanges.push_back({ SRV_INDEX(gTextures), SRV_TEXTURES_MAX, 0, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, HEAP_INDEX(gTextures) });
+-		heapRanges.push_back({ CBV_INDEX(gParams), 1, 0, D3D12_DESCRIPTOR_RANGE_TYPE_CBV, HEAP_INDEX(gParams) });
+-		rsc.AddHeapRangesParameter(heapRanges);
+-	}
+-
+-	{
+-		nv_helpers_dx12::RootSignatureGenerator::HeapRanges samplerHeapRange;
+-		samplerHeapRange.push_back({ 1, RT64_SAMPLER_HEAP_COUNT, 0, D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 0 });
+-		rsc.AddHeapRangesParameter(samplerHeapRange);
+-	}
+-
+ 	return rsc.Generate(d3dDevice, true, false, nullptr, 0);
+ }
+ 
+@@ -1853,7 +1931,14 @@ void RT64::Device::postRender(int vsyncInterval, View *activeView, bool frameGen
+ 
+ 	// Present the frame.
+ 	const UINT presentFlags = ((vsyncInterval == 0) && allowTearing) ? DXGI_PRESENT_ALLOW_TEARING : 0;
+-	D3D12_CHECK(d3dSwapChain->Present(vsyncInterval, presentFlags));
++	HRESULT presentHr = d3dSwapChain->Present(vsyncInterval, presentFlags);
++	if (FAILED(presentHr)) {
++		const HRESULT removed = (d3dDevice != nullptr) ? d3dDevice->GetDeviceRemovedReason() : presentHr;
++		fprintf(stderr, "RT64: Present failed hr=0x%08X deviceRemovedReason=0x%08X\n", (unsigned)presentHr, (unsigned)removed);
++		char errorMessage[512];
++		snprintf(errorMessage, sizeof(errorMessage), "D3D12 call d3dSwapChain->Present(vsyncInterval, presentFlags) failed with error code %X.", presentHr);
++		throw std::runtime_error(errorMessage);
++	}
+ 	waitForGPU();
+ 	d3dFrameIndex = d3dSwapChain->GetCurrentBackBufferIndex();
+ 
+@@ -1867,6 +1952,10 @@ void RT64::Device::postRender(int vsyncInterval, View *activeView, bool frameGen
+ }
+ 
+ bool RT64::Device::enableFrameGenSwapChain() {
++	if (isAmdGpu()) {
++		return false;
++	}
++
+ 	if (fgSwapChainActive) {
+ 		return true;
+ 	}
+@@ -1965,6 +2054,14 @@ void RT64::Device::draw(int vsyncInterval, float deltaTimeMs) {
+ 		scene->update();
+ 	}
+ 
++	// AMD TDR is ~2s per submitted GPU packet. BLAS/TLAS builds plus DispatchRays in
++	// one ExecuteCommandLists is enough to hang after a level load. Split them.
++	if (isAmdGpu()) {
++		submitCommandList();
++		waitForGPU();
++		resetCommandList();
++	}
++
+ 	// Determine the active view (use the first available view for now).
+ 	View *activeView = nullptr;
+ 	for (Scene *scene : scenes) {
+@@ -1974,7 +2071,7 @@ void RT64::Device::draw(int vsyncInterval, float deltaTimeMs) {
+ 		}
+ 	}
+ 
+-	const bool frameGenEnabled = (activeView != nullptr) && activeView->getFrameGen()->isInitialized() &&
++	const bool frameGenEnabled = (activeView != nullptr) && !isAmdGpu() && activeView->getFrameGen()->isInitialized() &&
+ 		activeView->getFrameGenEnabled() && enableFrameGenSwapChain();
+ 
+ 	d3dFrameIndex = d3dSwapChain->GetCurrentBackBufferIndex();
+diff --git a/src/rt64lib/private/rt64_device.h b/src/rt64lib/private/rt64_device.h
+index 631d364..1dac479 100644
+--- a/src/rt64lib/private/rt64_device.h
++++ b/src/rt64lib/private/rt64_device.h
+@@ -36,6 +36,7 @@ namespace RT64 {
+ 		IDXGIAdapter1 *d3dAdapter;
+ 		ID3D12Device8 *d3dDevice;
+ 		IDXGIFactory4 *dxgiFactory;
++		bool amdGpu;
+ 
+ 		void createDXGIFactory();
+ 		void createRaytracingDevice();
+@@ -102,13 +103,15 @@ namespace RT64 {
+ 		void *surfaceMissID;
+ 		void *shadowMissID;
+ 		Texture *blueNoise;
+-		ID3D12RootSignature *d3dRayGenSignature;
++		Texture *dummyBlack;
++		AllocatedResource dummyStructuredBuffer;
+ 		ID3D12PipelineState *im3dPipelineStatePoint;
+ 		ID3D12PipelineState *im3dPipelineStateLine;
+ 		ID3D12PipelineState *im3dPipelineStateTriangle;
+ 		ID3D12RootSignature *im3dRootSignature;
+ 		ID3D12StateObject *d3dRtStateObject;
+ 		ID3D12StateObjectProperties *d3dRtStateObjectProps;
++		ID3D12RootSignature *d3dRtGlobalRootSignature;
+ 
+ 		IDxcBlob *d3dUberSurfaceHitLibrary;
+ 		IDxcBlob *d3dUberShadowHitLibrary;
+@@ -164,10 +167,11 @@ namespace RT64 {
+ 		void loadPipeline();
+ 		void loadAssets();
+ 		void loadBlueNoise();
++		void loadDummyResources();
+ 		void createRaytracingPipeline();
+ 		void fallBackFromCustomShaders();
+ 		void createDxcCompiler();
+-		ID3D12RootSignature *createRayGenSignature();
++		ID3D12RootSignature *createEmptyGlobalRootSignature();
+ 		ID3D12RootSignature *createUberHitSignature(bool hitBuffers);
+ 		ID3D12RootSignature *createCustomHitSignature(bool hitBuffers);
+ 		ID3D12RootSignature *d3dCustomHitSignature;
+@@ -189,11 +193,13 @@ namespace RT64 {
+ 		void addInspector(Inspector* inspector);
+ 		void removeInspector(Inspector* inspector);
+ 		HWND getHwnd() const;
++		bool isAmdGpu() const;
+ 		ID3D12Device8 *getD3D12Device() const;
+ 		D3D12MA::Allocator *getD3D12Allocator() const;
+ 		ID3D12GraphicsCommandList4 *getD3D12CommandList() const;
+ 		ID3D12StateObject *getD3D12RtStateObject() const;
+ 		ID3D12StateObjectProperties *getD3D12RtStateObjectProperties() const;
++		ID3D12RootSignature *getD3D12RtGlobalRootSignature() const;
+ 		ID3D12Resource *getD3D12RenderTarget() const;
+ 		CD3DX12_CPU_DESCRIPTOR_HANDLE getD3D12RTV() const;
+ 		IDXGISwapChain3 *getD3D12SwapChain() const;
+@@ -240,6 +246,8 @@ namespace RT64 {
+ 		IDxcLibrary *getDxcLibrary() const;
+ 		Mipmaps *getMipmaps() const;
+ 		Texture *getBlueNoiseTexture() const;
++		Texture *getDummyBlackTexture() const;
++		ID3D12Resource *getDummyStructuredBuffer() const;
+ 		CD3DX12_VIEWPORT getD3D12Viewport() const;
+ 		CD3DX12_RECT getD3D12ScissorRect() const;
+ 		AllocatedResource allocateResource(D3D12_HEAP_TYPE HeapType, _In_  const D3D12_RESOURCE_DESC *pDesc, D3D12_RESOURCE_STATES InitialResourceState, _In_opt_  const D3D12_CLEAR_VALUE *pOptimizedClearValue, bool committed = false, bool shared = false);
+diff --git a/src/rt64lib/private/rt64_framegen.cpp b/src/rt64lib/private/rt64_framegen.cpp
+index 34c58c4..75553e6 100644
+--- a/src/rt64lib/private/rt64_framegen.cpp
++++ b/src/rt64lib/private/rt64_framegen.cpp
+@@ -83,6 +83,10 @@ public:
+             return false;
+         }
+ 
++        if (device->isAmdGpu()) {
++            return false;
++        }
++
+         release();
+ 
+         ffx::CreateBackendDX12Desc backendDesc{};
+diff --git a/src/rt64lib/private/rt64_nrd.cpp b/src/rt64lib/private/rt64_nrd.cpp
+index 6a35a46..13600a6 100644
+--- a/src/rt64lib/private/rt64_nrd.cpp
++++ b/src/rt64lib/private/rt64_nrd.cpp
+@@ -7,6 +7,8 @@
+ #include "rt64_nrd.h"
+ 
+ #include <algorithm>
++#include <cstdio>
++#include <stdexcept>
+ #include <vector>
+ 
+ #include "NRD.h"
+@@ -14,6 +16,22 @@
+ #include "rt64_common.h"
+ #include "rt64_device.h"
+ 
++#include <windows.h>
++
++static HRESULT CreateComputePipelineStateSEH(ID3D12Device *device, const D3D12_COMPUTE_PIPELINE_STATE_DESC *desc, ID3D12PipelineState **outPso) {
++	if (outPso == nullptr) {
++		return E_POINTER;
++	}
++
++	*outPso = nullptr;
++	__try {
++		return device->CreateComputePipelineState(desc, IID_PPV_ARGS(outPso));
++	}
++	__except (EXCEPTION_EXECUTE_HANDLER) {
++		return E_FAIL;
++	}
++}
++
+ static const float kWorldUnitsPerMeter = 100.0f;
+ static const float kDenoisingRange = 2.0e5f;
+ static const float kDiffuseMaxBlurRadius = 10.0f;
+@@ -196,7 +214,10 @@ private:
+ 			psoDesc.CS.BytecodeLength = pipelineDesc.computeShaderDXIL.size;
+ 
+ 			ID3D12PipelineState *pso = nullptr;
+-			D3D12_CHECK(device->getD3D12Device()->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&pso)));
++			HRESULT psoResult = CreateComputePipelineStateSEH(device->getD3D12Device(), &psoDesc, &pso);
++			if (FAILED(psoResult)) {
++				throw std::runtime_error("NRD CreateComputePipelineState failed. The denoiser is unavailable on this GPU/driver.");
++			}
+ 			pipelines.push_back(pso);
+ 		}
+ 	}
+@@ -282,6 +303,8 @@ public:
+ 		this->renderWidth = renderWidth;
+ 		this->renderHeight = renderHeight;
+ 
++		try {
++
+ 		blurRadiusScale = ((outputWidth > 0) && (renderWidth < outputWidth)) ? ((float)(renderWidth) / (float)(outputWidth)) : 1.0f;
+ 
+ 		nrd::DenoiserDesc denoiserDescs[] = {
+@@ -327,6 +350,15 @@ public:
+ 
+ 		hitDistanceParameters = {};
+ 		hitDistanceParameters.A *= kWorldUnitsPerMeter;
++		}
++		catch (const std::exception &e) {
++			fprintf(stderr, "RT64: NRD initialization failed: %s\n", e.what());
++			releaseResources();
++		}
++		catch (...) {
++			fprintf(stderr, "RT64: NRD initialization failed with an unknown error\n");
++			releaseResources();
++		}
+ 	}
+ 
+ 	void updateSettings(const DenoiseParameters &p) {
+diff --git a/src/rt64lib/private/rt64_view.cpp b/src/rt64lib/private/rt64_view.cpp
+index e80870f..b13e3a7 100644
+--- a/src/rt64lib/private/rt64_view.cpp
++++ b/src/rt64lib/private/rt64_view.cpp
+@@ -1083,69 +1083,86 @@ void RT64::View::writeSwapDescriptors(const std::function<D3D12_CPU_DESCRIPTOR_H
+ }
+ 
+ void RT64::View::writeDynamicDescriptors(const std::function<D3D12_CPU_DESCRIPTOR_HANDLE(HeapIndices)> &handleFor, bool forceRewrite) {
+-	D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc;
++	D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
++	ID3D12Device8 *d3dDevice = scene->getDevice()->getD3D12Device();
++	ID3D12Resource *dummyStructured = scene->getDevice()->getDummyStructuredBuffer();
+ 
+ 	// Add the Top Level AS SRV.
+ 	if (!topLevelASBuffers.result.IsNull()) {
+ 		D3D12_GPU_VIRTUAL_ADDRESS tlasVA = topLevelASBuffers.result.Get()->GetGPUVirtualAddress();
+ 		if (forceRewrite || (cachedTlasVA != tlasVA)) {
++			srvDesc = {};
+ 			srvDesc.Format = DXGI_FORMAT_UNKNOWN;
+ 			srvDesc.ViewDimension = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
+ 			srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+ 			srvDesc.RaytracingAccelerationStructure.Location = tlasVA;
+-			scene->getDevice()->getD3D12Device()->CreateShaderResourceView(nullptr, &srvDesc, handleFor(HeapIndices::SceneBVH));
++			d3dDevice->CreateShaderResourceView(nullptr, &srvDesc, handleFor(HeapIndices::SceneBVH));
+ 			cachedTlasVA = tlasVA;
+ 		}
+ 	}
+ 
+-	// Describe and create a constant buffer view for the lights.
+-	if (scene->getLightsCount() > 0) {
+-		ID3D12Resource *lightsBuffer = scene->getLightsBuffer();
+-		int lightsCount = scene->getLightsCount();
+-		if (forceRewrite || (cachedLightsBuffer != lightsBuffer) || (cachedLightsCount != lightsCount)) {
+-			srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+-			srvDesc.Format = DXGI_FORMAT_UNKNOWN;
+-			srvDesc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+-			srvDesc.Buffer.FirstElement = 0;
+-			srvDesc.Buffer.NumElements = lightsCount;
+-			srvDesc.Buffer.StructureByteStride = sizeof(RT64_LIGHT);
+-			srvDesc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+-			scene->getDevice()->getD3D12Device()->CreateShaderResourceView(lightsBuffer, &srvDesc, handleFor(HeapIndices::SceneLights));
+-			cachedLightsBuffer = lightsBuffer;
+-			cachedLightsCount = lightsCount;
+-		}
++	// Direct raygen always calls SceneLights.GetDimensions(). A missing descriptor
++	// returns garbage on AMD and the light loop then reads invalid memory.
++	ID3D12Resource *lightsBuffer = scene->getLightsBuffer();
++	int lightsCount = scene->getLightsCount();
++	if ((lightsBuffer == nullptr) || (lightsCount <= 0)) {
++		lightsBuffer = dummyStructured;
++		lightsCount = 1;
++	}
++	if (forceRewrite || (cachedLightsBuffer != lightsBuffer) || (cachedLightsCount != lightsCount)) {
++		srvDesc = {};
++		srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++		srvDesc.Format = DXGI_FORMAT_UNKNOWN;
++		srvDesc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
++		srvDesc.Buffer.FirstElement = 0;
++		srvDesc.Buffer.NumElements = static_cast<UINT>(lightsCount);
++		srvDesc.Buffer.StructureByteStride = sizeof(RT64_LIGHT);
++		srvDesc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
++		d3dDevice->CreateShaderResourceView(lightsBuffer, &srvDesc, handleFor(HeapIndices::SceneLights));
++		cachedLightsBuffer = lightsBuffer;
++		cachedLightsCount = lightsCount;
+ 	}
+ 
+ 	const UINT totalInstanceCount = static_cast<UINT>(rtInstances.size() + rasterBgInstances.size() + rasterFgInstances.size());
+ 
+-	// Describe the transforms buffer per instance.
+ 	{
+ 		ID3D12Resource *transformsBuffer = activeInstancesBufferTransforms.Get();
++		UINT transformCount = totalInstanceCount;
++		if ((transformsBuffer == nullptr) || (transformCount == 0)) {
++			transformsBuffer = dummyStructured;
++			transformCount = 1;
++		}
+ 		if (forceRewrite || (cachedInstanceTransformsBuffer != transformsBuffer) || (cachedInstanceCount != totalInstanceCount)) {
++			srvDesc = {};
+ 			srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+ 			srvDesc.Format = DXGI_FORMAT_UNKNOWN;
+ 			srvDesc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+ 			srvDesc.Buffer.FirstElement = 0;
+-			srvDesc.Buffer.NumElements = totalInstanceCount;
++			srvDesc.Buffer.NumElements = transformCount;
+ 			srvDesc.Buffer.StructureByteStride = sizeof(InstanceTransforms);
+ 			srvDesc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+-			scene->getDevice()->getD3D12Device()->CreateShaderResourceView(transformsBuffer, &srvDesc, handleFor(HeapIndices::instanceTransforms));
++			d3dDevice->CreateShaderResourceView(transformsBuffer, &srvDesc, handleFor(HeapIndices::instanceTransforms));
+ 			cachedInstanceTransformsBuffer = transformsBuffer;
+ 		}
+ 	}
+ 
+-	// Describe the properties buffer per instance.
+ 	{
+ 		ID3D12Resource *materialsBuffer = activeInstancesBufferMaterials.Get();
++		UINT materialCount = totalInstanceCount;
++		if ((materialsBuffer == nullptr) || (materialCount == 0)) {
++			materialsBuffer = dummyStructured;
++			materialCount = 1;
++		}
+ 		if (forceRewrite || (cachedInstanceMaterialsBuffer != materialsBuffer) || (cachedInstanceCount != totalInstanceCount)) {
++			srvDesc = {};
+ 			srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+ 			srvDesc.Format = DXGI_FORMAT_UNKNOWN;
+ 			srvDesc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+ 			srvDesc.Buffer.FirstElement = 0;
+-			srvDesc.Buffer.NumElements = totalInstanceCount;
++			srvDesc.Buffer.NumElements = materialCount;
+ 			srvDesc.Buffer.StructureByteStride = sizeof(RT64_MATERIAL);
+ 			srvDesc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+-			scene->getDevice()->getD3D12Device()->CreateShaderResourceView(materialsBuffer, &srvDesc, handleFor(HeapIndices::instanceMaterials));
++			d3dDevice->CreateShaderResourceView(materialsBuffer, &srvDesc, handleFor(HeapIndices::instanceMaterials));
+ 			cachedInstanceMaterialsBuffer = materialsBuffer;
+ 		}
+ 	}
+@@ -1230,44 +1247,55 @@ void RT64::View::createShaderResourceHeap() {
+ 			handle.ptr += handleIncrement;
+ 		}
+ 
+-		// Fill with null SRVs if the heap was just created.
+-		if (fillWithNull) {
+-			for (size_t i = usedTextures.size(); i < SRV_TEXTURES_MAX; i++) {
+-				scene->getDevice()->getD3D12Device()->CreateShaderResourceView(nullptr, &textureSRVDesc, handle);
+-				handle.ptr += handleIncrement;
++		if (fillWithNull || (customTextureSlots > 0)) {
++			Texture *dummyBlack = scene->getDevice()->getDummyBlackTexture();
++			D3D12_SHADER_RESOURCE_VIEW_DESC dummyTextureSRVDesc = {};
++			dummyTextureSRVDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
++			dummyTextureSRVDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++			dummyTextureSRVDesc.Format = (dummyBlack != nullptr) ? dummyBlack->getFormat() : DXGI_FORMAT_R8G8B8A8_UNORM;
++			dummyTextureSRVDesc.Texture2D.MostDetailedMip = 0;
++			dummyTextureSRVDesc.Texture2D.MipLevels = 1;
++			ID3D12Resource *dummyBlackResource = (dummyBlack != nullptr) ? dummyBlack->getTexture() : nullptr;
++
++			// Unused gTextures slots are still bound in the global 512-wide SRV table.
++			// Null SRVs become sparkles / TDR on AMD (NVIDIA returns black).
++			if (fillWithNull) {
++				for (size_t i = usedTextures.size(); i < SRV_TEXTURES_MAX; i++) {
++					scene->getDevice()->getD3D12Device()->CreateShaderResourceView(dummyBlackResource, &dummyTextureSRVDesc, handle);
++					handle.ptr += handleIncrement;
++				}
+ 			}
+-		}
+-
+-		if (customTextureSlots > 0) {
+-			auto writeInstanceTextures = [&](const std::vector<RenderInstance> &instances) {
+-				for (const RenderInstance &inst : instances) {
+-					if (inst.customTextureHeapIndex < 0) { continue; }
+-
+-					D3D12_CPU_DESCRIPTOR_HANDLE instanceHandle = descriptorHeap->GetCPUDescriptorHandleForHeapStart();
+-					instanceHandle.ptr += (size_t)(customTextureHeapStart() + inst.customTextureHeapIndex) * handleIncrement;
+ 
+-					Texture *const instanceTextures[RT64_CUSTOM_RASTER_MAX_TEXTURES] = {
+-						(inst.instance != nullptr) ? inst.instance->getDiffuseTexture() : nullptr,
+-						(inst.instance != nullptr) ? inst.instance->getDiffuse2Texture() : nullptr
+-					};
+-
+-					for (unsigned int i = 0; i < RT64_CUSTOM_RASTER_MAX_TEXTURES; i++) {
+-						if (instanceTextures[i] != nullptr) {
+-							textureSRVDesc.Format = instanceTextures[i]->getFormat();
+-							scene->getDevice()->getD3D12Device()->CreateShaderResourceView(instanceTextures[i]->getTexture(), &textureSRVDesc, instanceHandle);
++			if (customTextureSlots > 0) {
++				auto writeInstanceTextures = [&](const std::vector<RenderInstance> &instances) {
++					for (const RenderInstance &inst : instances) {
++						if (inst.customTextureHeapIndex < 0) { continue; }
++
++						D3D12_CPU_DESCRIPTOR_HANDLE instanceHandle = descriptorHeap->GetCPUDescriptorHandleForHeapStart();
++						instanceHandle.ptr += (size_t)(customTextureHeapStart() + inst.customTextureHeapIndex) * handleIncrement;
++
++						Texture *const instanceTextures[RT64_CUSTOM_RASTER_MAX_TEXTURES] = {
++							(inst.instance != nullptr) ? inst.instance->getDiffuseTexture() : nullptr,
++							(inst.instance != nullptr) ? inst.instance->getDiffuse2Texture() : nullptr
++						};
++
++						for (unsigned int i = 0; i < RT64_CUSTOM_RASTER_MAX_TEXTURES; i++) {
++							if (instanceTextures[i] != nullptr) {
++								textureSRVDesc.Format = instanceTextures[i]->getFormat();
++								scene->getDevice()->getD3D12Device()->CreateShaderResourceView(instanceTextures[i]->getTexture(), &textureSRVDesc, instanceHandle);
++							}
++							else {
++								scene->getDevice()->getD3D12Device()->CreateShaderResourceView(dummyBlackResource, &dummyTextureSRVDesc, instanceHandle);
++							}
++
++							instanceHandle.ptr += handleIncrement;
+ 						}
+-						else {
+-							textureSRVDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+-							scene->getDevice()->getD3D12Device()->CreateShaderResourceView(nullptr, &textureSRVDesc, instanceHandle);
+-						}
+-
+-						instanceHandle.ptr += handleIncrement;
+ 					}
+-				}
+-			};
++				};
+ 
+-			writeInstanceTextures(rasterBgInstances);
+-			writeInstanceTextures(rasterFgInstances);
++				writeInstanceTextures(rasterBgInstances);
++				writeInstanceTextures(rasterFgInstances);
++			}
+ 		}
+ 	}
+ 
+@@ -1465,15 +1493,6 @@ void RT64::View::createShaderResourceHeap() {
+ }
+ 
+ void RT64::View::createShaderBindingTable() {
+-	// The pointer to the beginning of the heap is the only parameter required by shaders without root parameters
+-	D3D12_GPU_DESCRIPTOR_HANDLE srvUavHeapHandle = descriptorHeap->GetGPUDescriptorHandleForHeapStart();
+-	D3D12_GPU_DESCRIPTOR_HANDLE samplerHeapHandle = samplerHeap->GetGPUDescriptorHandleForHeapStart();
+-	
+-	// The helper treats both root parameter pointers and heap pointers as void*, while DX12 uses the D3D12_GPU_DESCRIPTOR_HANDLE 
+-	// to define heap pointers. The pointer in this struct is a UINT64, which then has to be reinterpreted as a pointer.
+-	auto srvUavPointer = reinterpret_cast<UINT64 *>(srvUavHeapHandle.ptr);
+-	auto samplerPointer = reinterpret_cast<UINT64 *>(samplerHeapHandle.ptr);
+-
+ 	// Add the vertex buffers from all the meshes used by the instances to the hit group.
+ 	void *uberSurfaceHitGroupID = scene->getDevice()->getSurfaceHitGroupID();
+ 	void *uberShadowHitGroupID = scene->getDevice()->getShadowHitGroupID();
+@@ -1521,15 +1540,13 @@ void RT64::View::createShaderBindingTable() {
+ 	// The SBT helper class collects calls to Add*Program. If called several times, the helper must be emptied before re-adding shaders.
+ 	sbtHelper.Reset();
+ 
+-	// The ray generation only uses heap data.
+-	sbtHelper.AddRayGenerationProgram(scene->getDevice()->getPrimaryRayGenID(), { srvUavPointer });
+-	sbtHelper.AddRayGenerationProgram(scene->getDevice()->getDirectRayGenID(), { srvUavPointer });
+-	sbtHelper.AddRayGenerationProgram(scene->getDevice()->getIndirectRayGenID(), { srvUavPointer });
+-	sbtHelper.AddRayGenerationProgram(scene->getDevice()->getReflectionRayGenID(), { srvUavPointer });
+-	sbtHelper.AddRayGenerationProgram(scene->getDevice()->getRefractionRayGenID(), { srvUavPointer });
+-	sbtHelper.AddRayGenerationProgram(scene->getDevice()->getVolumetricRayGenID(), { srvUavPointer });
+-
+-	// Miss shaders don't use any external data.
++	// The ray generation and miss shaders use only the global root signature.
++	sbtHelper.AddRayGenerationProgram(scene->getDevice()->getPrimaryRayGenID(), {});
++	sbtHelper.AddRayGenerationProgram(scene->getDevice()->getDirectRayGenID(), {});
++	sbtHelper.AddRayGenerationProgram(scene->getDevice()->getIndirectRayGenID(), {});
++	sbtHelper.AddRayGenerationProgram(scene->getDevice()->getReflectionRayGenID(), {});
++	sbtHelper.AddRayGenerationProgram(scene->getDevice()->getRefractionRayGenID(), {});
++	sbtHelper.AddRayGenerationProgram(scene->getDevice()->getVolumetricRayGenID(), {});
+ 	sbtHelper.AddMissProgram(scene->getDevice()->getSurfaceMissID(), {});
+ 	sbtHelper.AddMissProgram(scene->getDevice()->getShadowMissID(), {});
+ 
+@@ -1544,8 +1561,6 @@ void RT64::View::createShaderBindingTable() {
+ 		hitGroupArgs.clear();
+ 		hitGroupArgs.push_back((void *)(rtInstance.vertexBufferView->BufferLocation));
+ 		hitGroupArgs.push_back((void *)(rtInstance.indexBufferView->BufferLocation));
+-		hitGroupArgs.push_back(srvUavPointer);
+-		hitGroupArgs.push_back(samplerPointer);
+ 
+ 		if (usesCustomHitGroups) {
+ 			for (uint32_t reg = 1; reg < RT64_MAX_SHADER_UNIFORM_BLOCKS; reg++) {
+@@ -2149,7 +2164,7 @@ void RT64::View::render(float deltaTimeMs) {
+ 	};
+ 
+ 	// Raytracing.
+-	if (!rtInstances.empty()) {
++	if (!rtInstances.empty() && !topLevelASBuffers.result.IsNull() && !sbtStorage.IsNull()) {
+ 		RT64_LOG_PRINTF("Drawing raytraced instances");
+ 
+ 		// Ray generation.
+@@ -2190,10 +2205,35 @@ void RT64::View::render(float deltaTimeMs) {
+ 		d3dCommandList->ResourceBarrier(_countof(preDispatchBarriers), preDispatchBarriers);
+ 
+ 		// Bind pipeline and dispatch primary rays.
++		// AMD / vkd3d-proton do not implicitly bind the RTPSO global root signature.
++		// NVIDIA drivers do, which is why this used to look NVIDIA-only.
+ 		RT64_LOG_PRINTF("Dispatching primary rays");
++		ID3D12RootSignature *rtGlobalRootSignature = scene->getDevice()->getD3D12RtGlobalRootSignature();
++		D3D12_GPU_DESCRIPTOR_HANDLE rtSrvUavTable = descriptorHeap->GetGPUDescriptorHandleForHeapStart();
++		D3D12_GPU_DESCRIPTOR_HANDLE rtSamplerTable = samplerHeap->GetGPUDescriptorHandleForHeapStart();
++		auto dispatchRays = [&]() {
++			d3dCommandList->SetDescriptorHeaps(static_cast<UINT>(heaps.size()), heaps.data());
++			d3dCommandList->SetComputeRootSignature(rtGlobalRootSignature);
++			d3dCommandList->SetComputeRootDescriptorTable(0, rtSrvUavTable);
++			d3dCommandList->SetComputeRootDescriptorTable(1, rtSamplerTable);
++			d3dCommandList->DispatchRays(&desc);
++		};
++		// Windows TDR is ~2s per ExecuteCommandLists. Primary anyhit plus
++		// shadows in one packet still hangs AMD after a level load.
++		auto flushAmdRayPacket = [&]() {
++			if (!scene->getDevice()->isAmdGpu()) {
++				return;
++			}
++			scene->getDevice()->submitCommandList();
++			scene->getDevice()->waitForGPU();
++			scene->getDevice()->resetCommandList();
++			d3dCommandList->SetPipelineState1(scene->getDevice()->getD3D12RtStateObject());
++			d3dCommandList->SetDescriptorHeaps(static_cast<UINT>(heaps.size()), heaps.data());
++		};
+ 		d3dCommandList->SetPipelineState1(scene->getDevice()->getD3D12RtStateObject());
+ 		d3dCommandList->SetDescriptorHeaps(static_cast<UINT>(heaps.size()), heaps.data());
+-		d3dCommandList->DispatchRays(&desc);
++		dispatchRays();
++		flushAmdRayPacket();
+ 
+ 		// Barriers for shading buffers before dispatching secondary rays.
+ 		CD3DX12_RESOURCE_BARRIER shadingBarriers[] = {
+@@ -2212,12 +2252,16 @@ void RT64::View::render(float deltaTimeMs) {
+ 		// Dispatch rays for direct light.
+ 		RT64_LOG_PRINTF("Dispatching direct light rays");
+ 		desc.RayGenerationShaderRecord.StartAddress = sbtStorage.Get()->GetGPUVirtualAddress() + sbtHelper.GetRayGenEntrySize();
+-		d3dCommandList->DispatchRays(&desc);
++		dispatchRays();
++		flushAmdRayPacket();
+ 
+-		// Dispatch rays for indirect light.
++		// Always dispatch indirect. giSamples==0 still writes ambientBase+ambientNoGI
++		// into the GI buffer. Skipping that left Compose with an uninitialized or
++		// zero buffer: yellow/orange "sunset" lighting and intermittent sparkles.
+ 		RT64_LOG_PRINTF("Dispatching indirect light rays");
+ 		desc.RayGenerationShaderRecord.StartAddress = sbtStorage.Get()->GetGPUVirtualAddress() + sbtHelper.GetRayGenEntrySize() * 2;
+-		d3dCommandList->DispatchRays(&desc);
++		dispatchRays();
++		flushAmdRayPacket();
+ 
+ 		// Wait until indirect light is done before dispatching reflection or refraction rays.
+ 		// TODO: This is only required to prevent simultaneous usage of the anyhit buffers.
+@@ -2228,7 +2272,8 @@ void RT64::View::render(float deltaTimeMs) {
+ 		if (rtAnyRefraction) {
+ 			RT64_LOG_PRINTF("Dispatching refraction rays");
+ 			desc.RayGenerationShaderRecord.StartAddress = sbtStorage.Get()->GetGPUVirtualAddress() + sbtHelper.GetRayGenEntrySize() * 4;
+-			d3dCommandList->DispatchRays(&desc);
++			dispatchRays();
++			flushAmdRayPacket();
+ 
+ 			// Wait until refraction is done before dispatching reflection rays.
+ 			// TODO: This is only required to prevent simultaneous usage of the anyhit buffers.
+@@ -2237,11 +2282,12 @@ void RT64::View::render(float deltaTimeMs) {
+ 			d3dCommandList->ResourceBarrier(1, &refractionBarrier);
+ 		}
+ 
+-		const bool volumetricLights = scene->getVolumetricLights();
++		const bool volumetricLights = scene->getVolumetricLights() && (scene->getLightsCount() > 0);
+ 		if (volumetricLights) {
+ 			RT64_LOG_PRINTF("Dispatching volumetric light rays");
+ 			desc.RayGenerationShaderRecord.StartAddress = sbtStorage.Get()->GetGPUVirtualAddress() + sbtHelper.GetRayGenEntrySize() * 5;
+-			d3dCommandList->DispatchRays(&desc);
++			dispatchRays();
++			flushAmdRayPacket();
+ 		}
+ 
+ 		if (rtAnyReflection) {
+@@ -2250,7 +2296,8 @@ void RT64::View::render(float deltaTimeMs) {
+ 				// Dispatch rays for reflection.
+ 				RT64_LOG_PRINTF("Dispatching reflection rays");
+ 				desc.RayGenerationShaderRecord.StartAddress = sbtStorage.Get()->GetGPUVirtualAddress() + sbtHelper.GetRayGenEntrySize() * 3;
+-				d3dCommandList->DispatchRays(&desc);
++				dispatchRays();
++				flushAmdRayPacket();
+ 				reflections--;
+ 
+ 				// Add a barrier to wait for the input UAVs to be finished if there's more passes left to be done.
+@@ -3080,6 +3127,12 @@ bool RT64::View::getUpscalerAccelerated(UpscaleMode mode) const {
+ }
+ 
+ void RT64::View::setFrameGenEnabled(bool v) {
++	if (scene->getDevice()->isAmdGpu()) {
++		if (v) {
++			fprintf(stderr, "RT64: FSR frame generation is disabled on AMD\n");
++		}
++		v = false;
++	}
+ 	if (frameGenEnabled != v) {
+ 		frameGenEnabled = v;
+ 		rtRecreateBuffers = true;
+diff --git a/src/rt64lib/shaders/CustomSurfaceHit.hlsl b/src/rt64lib/shaders/CustomSurfaceHit.hlsl
+index f19d70a..4521448 100644
+--- a/src/rt64lib/shaders/CustomSurfaceHit.hlsl
++++ b/src/rt64lib/shaders/CustomSurfaceHit.hlsl
+@@ -30,6 +30,7 @@ void CustomSurfaceAnyHit(inout HitInfo payload, Attributes attrib) {
+ 
+ 	// This hit is beyond a confirmed-opaque surface and is never visible.
+ 	if (RayTCurrent() > (payload.opaqueT + maxDepthBias)) {
++		IgnoreHit();
+ 		return;
+ 	}
+ 
+diff --git a/src/rt64lib/shaders/IndirectRayGen.hlsl b/src/rt64lib/shaders/IndirectRayGen.hlsl
+index 57d072b..ff1f8fb 100644
+--- a/src/rt64lib/shaders/IndirectRayGen.hlsl
++++ b/src/rt64lib/shaders/IndirectRayGen.hlsl
+@@ -72,7 +72,7 @@ void IndirectRayGen() {
+ 			float3 resNormal = float3(0.0f, 0.0f, 0.0f);
+ 			float4 resColor = float4(0, 0, 0, 1);
+ 			int resInstanceId = -1;
+-			for (uint hit = 0; hit < payload.nhits; hit++) {
++			for (uint hit = 0; hit < min(payload.nhits, MAX_HIT_QUERIES); hit++) {
+ 				uint hitBufferIndex = getHitBufferIndex(hit, launchIndex, launchDims);
+ 				float4 hitColor = gHitColor[hitBufferIndex];
+ 				float alphaContrib = (resColor.a * hitColor.a);
+diff --git a/src/rt64lib/shaders/Lights.hlsli b/src/rt64lib/shaders/Lights.hlsli
+index 0a5e28e..2ab7d8d 100644
+--- a/src/rt64lib/shaders/Lights.hlsli
++++ b/src/rt64lib/shaders/Lights.hlsli
+@@ -32,9 +32,18 @@ struct LightInfo {
+ StructuredBuffer<LightInfo> SceneLights : register(t4);
+ 
+ #define MAX_LIGHTS 16
++#define RT64_SCENE_LIGHTS_MAX 256
+ #define RT64_LIGHT_TYPE_POINT 1
+ #define RT64_LIGHT_SHAPE_SQUARE 1
+ 
++// AMD GetDimensions on a bad/upload SRV can return ~4e9. Iterating that per pixel TDRs
++// with DXGI_ERROR_DEVICE_HUNG (0x887A0006). NVIDIA returns 0 or the real count.
++uint GetSceneLightCount() {
++	uint lightCount, lightStride;
++	SceneLights.GetDimensions(lightCount, lightStride);
++	return min(lightCount, RT64_SCENE_LIGHTS_MAX);
++}
++
+ void ComputePointLightBasis(float pitch, float yaw, float roll, out float3 lightForward, out float3 lightRight, out float3 lightUp) {
+ 	float sinYaw = sin(yaw), cosYaw = cos(yaw);
+ 	float3 forwardYawed = float3(sinYaw, 0.0f, cosYaw);
+@@ -262,11 +271,10 @@ float3 ComputeLightsRandom(uint2 launchIndex, uint instanceId, float3 position,
+ 	float centeredShadowFactor = traceShadows ? TraceCenteredShadow(instanceId, position, normal, centeredInstanceMask) : 1.0f;
+ 	if (lightGroupMaskBits > 0) {
+ 		uint sLightCount = 0;
+-		uint gLightCount, gLightStride;
++		uint gLightCount = GetSceneLightCount();
+ 		uint sLightIndices[MAX_LIGHTS + 1];
+ 		float sLightIntensities[MAX_LIGHTS + 1];
+ 		float totalLightIntensity = 0.0f;
+-		SceneLights.GetDimensions(gLightCount, gLightStride);
+ 		for (uint l = 0; (l < gLightCount) && (sLightCount < MAX_LIGHTS); l++) {
+ 			if (lightGroupMaskBits & SceneLights[l].groupBits) {
+ 				float lightIntensity = CalculateLightIntensitySimple(l, position, normal, ignoreNormalFactor);
+diff --git a/src/rt64lib/shaders/PrimaryRayGen.hlsl b/src/rt64lib/shaders/PrimaryRayGen.hlsl
+index 8b66e78..fe9560b 100644
+--- a/src/rt64lib/shaders/PrimaryRayGen.hlsl
++++ b/src/rt64lib/shaders/PrimaryRayGen.hlsl
+@@ -85,7 +85,7 @@ void PrimaryRayGen() {
+ 	int resPickInstanceId = -1;
+ 	float depthWriteT = RAY_MAX_DISTANCE;
+ 	float depthWriteOrder = 0.0f;
+-	for (uint hit = 0; hit < payload.nhits; hit++) {
++	for (uint hit = 0; hit < min(payload.nhits, MAX_HIT_QUERIES); hit++) {
+ 		uint hitBufferIndex = getHitBufferIndex(hit, launchIndex, launchDims);
+ 		float4 hitColor = gHitColor[hitBufferIndex];
+ 		uint hitInstanceId = gHitInstanceId[hitBufferIndex];
+diff --git a/src/rt64lib/shaders/ReflectionRayGen.hlsl b/src/rt64lib/shaders/ReflectionRayGen.hlsl
+index 39842e3..89bcb50 100644
+--- a/src/rt64lib/shaders/ReflectionRayGen.hlsl
++++ b/src/rt64lib/shaders/ReflectionRayGen.hlsl
+@@ -65,7 +65,7 @@ void ReflectionRayGen() {
+ 	float3 resTransparent = float3(0.0f, 0.0f, 0.0f);
+ 	float depthWriteT = RAY_MAX_DISTANCE;
+ 	float depthWriteOrder = 0.0f;
+-	for (uint hit = 0; hit < payload.nhits; hit++) {
++	for (uint hit = 0; hit < min(payload.nhits, MAX_HIT_QUERIES); hit++) {
+ 		uint hitBufferIndex = getHitBufferIndex(hit, launchIndex, launchDims);
+ 		float4 hitColor = gHitColor[hitBufferIndex];
+ 
+diff --git a/src/rt64lib/shaders/RefractionRayGen.hlsl b/src/rt64lib/shaders/RefractionRayGen.hlsl
+index 756aeb3..5aded48 100644
+--- a/src/rt64lib/shaders/RefractionRayGen.hlsl
++++ b/src/rt64lib/shaders/RefractionRayGen.hlsl
+@@ -66,7 +66,7 @@ void RefractionRayGen() {
+ 	float3 resTransparent = float3(0.0f, 0.0f, 0.0f);
+ 	float depthWriteT = RAY_MAX_DISTANCE;
+ 	float depthWriteOrder = 0.0f;
+-	for (uint hit = 0; hit < payload.nhits; hit++) {
++	for (uint hit = 0; hit < min(payload.nhits, MAX_HIT_QUERIES); hit++) {
+ 		uint hitBufferIndex = getHitBufferIndex(hit, launchIndex, launchDims);
+ 		float4 hitColor = gHitColor[hitBufferIndex];
+ 
+diff --git a/src/rt64lib/shaders/UberSurfaceHit.hlsl b/src/rt64lib/shaders/UberSurfaceHit.hlsl
+index 3d22dc0..c058534 100644
+--- a/src/rt64lib/shaders/UberSurfaceHit.hlsl
++++ b/src/rt64lib/shaders/UberSurfaceHit.hlsl
+@@ -35,6 +35,7 @@ void UberSurfaceAnyHit(inout HitInfo payload, Attributes attrib) {
+ 
+ 	// This hit is beyond a confirmed-opaque surface and is never visible.
+ 	if (RayTCurrent() > (payload.opaqueT + maxDepthBias)) {
++		IgnoreHit();
+ 		return;
+ 	}
+ 
+diff --git a/src/rt64lib/shaders/VolumetricRayGen.hlsl b/src/rt64lib/shaders/VolumetricRayGen.hlsl
+index 6bf3367..7403b85 100644
+--- a/src/rt64lib/shaders/VolumetricRayGen.hlsl
++++ b/src/rt64lib/shaders/VolumetricRayGen.hlsl
+@@ -28,8 +28,7 @@ void VolumetricRayGen() {
+ 	float maxDist = (instanceId >= 0) ? length(shadingPosition - rayOrigin) : RAY_MAX_DISTANCE;
+ 
+ 	float3 result = float3(0.0f, 0.0f, 0.0f);
+-	uint lightCount, lightStride;
+-	SceneLights.GetDimensions(lightCount, lightStride);
++	uint lightCount = GetSceneLightCount();
+ 	for (uint l = 0; l < lightCount; l++) {
+ 		if ((SceneLights[l].lightType != RT64_LIGHT_TYPE_POINT) || (SceneLights[l].volumetricEnabled == 0)) {
+ 			continue;
