@@ -307,7 +307,7 @@ static struct ShaderProgram *gfx_rt64_rapi_create_and_load_new_shader(struct Col
 
     {
         const std::lock_guard<std::mutex> lock(RT64.shaderProgramsMutex);
-        auto it = RT64.shaderPrograms.find(rt64Hash);
+        auto it = RT64.shaderPrograms.find(cc->hash);
         if (it != RT64.shaderPrograms.end()) {
             gfx_rt64_rapi_load_shader((struct ShaderProgram *)(it->second));
             return (struct ShaderProgram *)(it->second);
@@ -376,7 +376,7 @@ static struct ShaderProgram *gfx_rt64_rapi_create_and_load_new_shader(struct Col
 
     {
         const std::lock_guard<std::mutex> lock(RT64.shaderProgramsMutex);
-        RT64.shaderPrograms[rt64Hash] = shaderProgram;
+        RT64.shaderPrograms[cc->hash] = shaderProgram;
     }
 
     gfx_rt64_rapi_load_shader((struct ShaderProgram *)(shaderProgram));
@@ -390,10 +390,8 @@ static struct ShaderProgram *gfx_rt64_rapi_create_or_load_post_process_shader(vo
 }
 
 static struct ShaderProgram *gfx_rt64_rapi_lookup_shader(struct ColorCombiner *cc) {
-    RT64_COMBINER_DESC desc = gfx_rt64_combiner_desc_from_cc(cc);
-    u64 rt64Hash = gfx_rt64_combiner_desc_hash(desc);
     const std::lock_guard<std::mutex> lock(RT64.shaderProgramsMutex);
-    auto it = RT64.shaderPrograms.find(rt64Hash);
+    auto it = RT64.shaderPrograms.find(cc->hash);
     return (it != RT64.shaderPrograms.end()) ? (struct ShaderProgram *)(it->second) : nullptr;
 }
 
